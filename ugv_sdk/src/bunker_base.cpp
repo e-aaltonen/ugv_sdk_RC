@@ -1,5 +1,11 @@
+/* Modifications by E. Aaltonen 2023
+ * for publishing RC status messages
+ * changes indicated: // EA
+ */
+ 
 #include "ugv_sdk/bunker/bunker_base.hpp"
 
+#include <stdio.h>
 #include <string>
 #include <cstring>
 #include <iostream>
@@ -10,67 +16,92 @@
 #include <ratio>
 #include <thread>
 
-#include "stopwatch.h"
+#include "stopwatch.hpp"
 
 namespace westonrobot {
 void BunkerBase::SendRobotCmd() {
   static uint8_t cmd_count = 0;
-  static uint8_t light_cmd_count = 0;
-  SendMotionCmd(cmd_count++);
+  //   EnableCommandedMode();
+  if (can_connected_) {
+    EnableCommandedMode();
+    SendMotionCmd(cmd_count++);
+  }
+}
+
+void BunkerBase::EnableCommandedMode() {
+  AgxMessage c_msg;
+  c_msg.type = AgxMsgCtrlModeSelect;
+  memset(c_msg.body.ctrl_mode_select_msg.raw, 0, 8);
+  c_msg.body.ctrl_mode_select_msg.cmd.control_mode = CTRL_MODE_CMD_CAN;
+
+  // send to can bus
+  can_frame c_frame;
+  EncodeCanFrame(&c_msg, &c_frame);
+  can_if_->SendFrame(c_frame);
 }
 
 void BunkerBase::SendMotionCmd(uint8_t count) {
   // motion control message
-  BunkerMessage m_msg;
-  m_msg.type = BunkerMotionControlMsg;
-
-  if (can_connected_)
-    m_msg.body.motion_control_msg.data.cmd.control_mode = CTRL_MODE_CMD_CAN;
-  else if (serial_connected_)
-    m_msg.body.motion_control_msg.data.cmd.control_mode = CTRL_MODE_CMD_UART;
+  AgxMessage m_msg;
+  m_msg.type = AgxMsgMotionCommand;
+  memset(m_msg.body.motion_command_msg.raw, 0, 8);
 
   motion_cmd_mutex_.lock();
-  m_msg.body.motion_control_msg.data.cmd.fault_clear_flag =
-      static_cast<uint8_t>(current_motion_cmd_.fault_clear_flag);
-  m_msg.body.motion_control_msg.data.cmd.linear_velocity_cmd =
-      current_motion_cmd_.linear_velocity;
-  m_msg.body.motion_control_msg.data.cmd.angular_velocity_cmd =
-      current_motion_cmd_.angular_velocity;
+  int16_t linear_cmd =
+      static_cast<int16_t>(current_motion_cmd_.linear_velocity * 1000);
+  int16_t angular_cmd =
+      static_cast<int16_t>(current_motion_cmd_.angular_velocity * 1000);
   motion_cmd_mutex_.unlock();
 
-  m_msg.body.motion_control_msg.data.cmd.reserved0 = 0;
-  m_msg.body.motion_control_msg.data.cmd.reserved1 = 0;
-  m_msg.body.motion_control_msg.data.cmd.count = count;
+  // SendControlCmd();
+  m_msg.body.motion_command_msg.cmd.linear_velocity.high_byte =
+      (static_cast<uint16_t>(linear_cmd) >> 8) & 0x00ff;
+  m_msg.body.motion_command_msg.cmd.linear_velocity.low_byte =
+      (static_cast<uint16_t>(linear_cmd) >> 0) & 0x00ff;
+  m_msg.body.motion_command_msg.cmd.angular_velocity.high_byte =
+      (static_cast<uint16_t>(angular_cmd) >> 8) & 0x00ff;
+  m_msg.body.motion_command_msg.cmd.angular_velocity.low_byte =
+      (static_cast<uint16_t>(angular_cmd) >> 0) & 0x00ff;
 
-  if (can_connected_)
-    m_msg.body.motion_control_msg.data.cmd.checksum =
-        CalcBunkerCANChecksum(CAN_MSG_MOTION_CONTROL_CMD_ID,
-                             m_msg.body.motion_control_msg.data.raw, 8);
-  // serial_connected_: checksum will be calculated later when packed into a
-  // complete serial frame
-
-  if (can_connected_) {
-    // send to can bus
-    can_frame m_frame;
-    EncodeBunkerMsgToCAN(&m_msg, &m_frame);
-    can_if_->SendFrame(m_frame);
-  } else {
-    // send to serial port
-//    EncodeBunkerMsgToUART(&m_msg, tx_buffer_, &tx_cmd_len_);
-//    serial_if_->SendBytes(tx_buffer_, tx_cmd_len_);
-  }
+  // send to can bus
+  can_frame m_frame;
+  EncodeCanFrame(&m_msg, &m_frame);
+  can_if_->SendFrame(m_frame);
 }
 
+void BunkerBase::SendLightCmd(const BunkerLightCmd &lcmd, uint8_t count) {
+  AgxMessage l_msg;
+  l_msg.type = AgxMsgLightCommand;
+  memset(l_msg.body.light_command_msg.raw, 0, 8);
 
+  if (lcmd.enable_ctrl) {
+    l_msg.body.light_command_msg.cmd.light_ctrl_enabled = LIGHT_CTRL_ENABLE;
+
+    l_msg.body.light_command_msg.cmd.front_light_mode =
+        static_cast<uint8_t>(lcmd.front_mode);
+    l_msg.body.light_command_msg.cmd.front_light_custom =
+        lcmd.front_custom_value;
+    l_msg.body.light_command_msg.cmd.rear_light_mode =
+        static_cast<uint8_t>(lcmd.rear_mode);
+    l_msg.body.light_command_msg.cmd.rear_light_custom = lcmd.rear_custom_value;
+  } else {
+    l_msg.body.light_command_msg.cmd.light_ctrl_enabled = LIGHT_CTRL_DISABLE;
+  }
+
+  l_msg.body.light_command_msg.cmd.count = count;
+
+  // send to can bus
+  can_frame l_frame;
+  EncodeCanFrame(&l_msg, &l_frame);
+  can_if_->SendFrame(l_frame);
+}
 
 BunkerState BunkerBase::GetBunkerState() {
   std::lock_guard<std::mutex> guard(bunker_state_mutex_);
   return bunker_state_;
 }
 
-void BunkerBase::SetMotionCommand(
-    double linear_vel, double angular_vel,
-    BunkerMotionCmd::FaultClearFlag fault_clr_flag) {
+void BunkerBase::SetMotionCommand(double linear_vel, double angular_vel) {
   // make sure cmd thread is started before attempting to send commands
   if (!cmd_thread_started_) StartCmdThread();
 
@@ -78,123 +109,152 @@ void BunkerBase::SetMotionCommand(
     linear_vel = BunkerMotionCmd::min_linear_velocity;
   if (linear_vel > BunkerMotionCmd::max_linear_velocity)
     linear_vel = BunkerMotionCmd::max_linear_velocity;
+  if (scan_stop) linear_vel = 0.0;
+
   if (angular_vel < BunkerMotionCmd::min_angular_velocity)
     angular_vel = BunkerMotionCmd::min_angular_velocity;
   if (angular_vel > BunkerMotionCmd::max_angular_velocity)
     angular_vel = BunkerMotionCmd::max_angular_velocity;
-  //std::cout<<angular_vel<<std::endl;
+
   std::lock_guard<std::mutex> guard(motion_cmd_mutex_);
-  current_motion_cmd_.linear_velocity = static_cast<int8_t>(
-      linear_vel / BunkerMotionCmd::max_linear_velocity * 100.0);
-  current_motion_cmd_.angular_velocity = static_cast<int8_t>(
-      angular_vel / BunkerMotionCmd::max_angular_velocity * 100.0);
-  current_motion_cmd_.fault_clear_flag = fault_clr_flag;
+  current_motion_cmd_.linear_velocity = linear_vel;
+  current_motion_cmd_.angular_velocity = angular_vel;
+
   FeedCmdTimeoutWatchdog();
 }
 
+void BunkerBase::SetLightCommand(const BunkerLightCmd &cmd) {
+  static uint8_t light_cmd_count = 0;
+  SendLightCmd(cmd, light_cmd_count++);
+}
 
+void BunkerBase::DisableLightCmdControl() {
+  static uint8_t light_cmd_count = 0;
+  BunkerLightCmd cmd;
+  cmd.enable_ctrl = 0;
+  SendLightCmd(cmd, light_cmd_count++);
+}
 
 void BunkerBase::ParseCANFrame(can_frame *rx_frame) {
-  // validate checksum, discard frame if fails
-  if (!rx_frame->data[7] == CalcBunkerCANChecksum(rx_frame->can_id,
-                                                 rx_frame->data,
-                                                 rx_frame->can_dlc)) {
-    std::cerr << "ERROR: checksum mismatch, discard frame with id "
-              << rx_frame->can_id << std::endl;
-    return;
-  }
-
-  // otherwise, update robot state with new frame
-  BunkerMessage status_msg;
-  DecodeBunkerMsgFromCAN(rx_frame, &status_msg);
+  AgxMessage status_msg;
+  DecodeCanFrame(rx_frame, &status_msg);
   NewStatusMsgReceivedCallback(status_msg);
 }
 
-//void BunkerBase::ParseUARTBuffer(uint8_t *buf, const size_t bufsize,
-//                                size_t bytes_received) {
-//  // std::cout << "bytes received from serial: " << bytes_received << std::endl;
-//  // serial_parser_.PrintStatistics();
-//  // serial_parser_.ParseBuffer(buf, bytes_received);
-//  BunkerMessage status_msg;
-//  for (int i = 0; i < bytes_received; ++i) {
-//    if (DecodeBunkerMsgFromUART(buf[i], &status_msg))
-//      NewStatusMsgReceivedCallback(status_msg);
-//  }
-//}
-
-void BunkerBase::NewStatusMsgReceivedCallback(const BunkerMessage &msg) {
+void BunkerBase::NewStatusMsgReceivedCallback(const AgxMessage &msg) {
   // std::cout << "new status msg received" << std::endl;
   std::lock_guard<std::mutex> guard(bunker_state_mutex_);
   UpdateBunkerState(msg, bunker_state_);
 }
 
-void BunkerBase::UpdateBunkerState(const BunkerMessage &status_msg,
+void BunkerBase::UpdateBunkerState(const AgxMessage &status_msg,
                                  BunkerState &state) {
   switch (status_msg.type) {
-    case BunkerMotionStatusMsg: {
+    case AgxMsgSystemState: {
+      // std::cout << "system status feedback received" << std::endl;
+      const SystemStateMessage &msg = status_msg.body.system_state_msg;
+      state.control_mode = msg.state.control_mode;
+      state.base_state = msg.state.vehicle_state;
+      state.battery_voltage =
+          (static_cast<uint16_t>(msg.state.battery_voltage.low_byte) |
+           static_cast<uint16_t>(msg.state.battery_voltage.high_byte) << 8) /
+          10.0;
+      state.fault_code = msg.state.fault_code;
+      break;
+    }
+    case AgxMsgMotionState: {
       // std::cout << "motion control feedback received" << std::endl;
-      const MotionStatusMessage &msg = status_msg.body.motion_status_msg;
+      const MotionStateMessage &msg = status_msg.body.motion_state_msg;
       state.linear_velocity =
           static_cast<int16_t>(
-              static_cast<uint16_t>(msg.data.status.linear_velocity.low_byte) |
-              static_cast<uint16_t>(msg.data.status.linear_velocity.high_byte)
-                  << 8) /
+              static_cast<uint16_t>(msg.state.linear_velocity.low_byte) |
+              static_cast<uint16_t>(msg.state.linear_velocity.high_byte) << 8) /
           1000.0;
       state.angular_velocity =
           static_cast<int16_t>(
-              static_cast<uint16_t>(msg.data.status.angular_velocity.low_byte) |
-              static_cast<uint16_t>(msg.data.status.angular_velocity.high_byte)
+              static_cast<uint16_t>(msg.state.angular_velocity.low_byte) |
+              static_cast<uint16_t>(msg.state.angular_velocity.high_byte)
                   << 8) /
           1000.0;
       break;
     }
-    case BunkerLightStatusMsg: {
+    case AgxMsgLightState: {
       // std::cout << "light control feedback received" << std::endl;
-      const LightStatusMessage &msg = status_msg.body.light_status_msg;
-      if (msg.data.status.light_ctrl_enable == LIGHT_DISABLE_CTRL)
+      const LightStateMessage &msg = status_msg.body.light_state_msg;
+      if (msg.state.light_ctrl_enabled == LIGHT_CTRL_DISABLE)
         state.light_control_enabled = false;
       else
         state.light_control_enabled = true;
-      state.front_light_state.mode = msg.data.status.front_light_mode;
-      state.front_light_state.custom_value = msg.data.status.front_light_custom;
-      state.rear_light_state.mode = msg.data.status.rear_light_mode;
-      state.rear_light_state.custom_value = msg.data.status.rear_light_custom;
+      state.front_light_state.mode = msg.state.front_light_mode;
+      state.front_light_state.custom_value = msg.state.front_light_custom;
+      state.rear_light_state.mode = msg.state.rear_light_mode;
+      state.rear_light_state.custom_value = msg.state.rear_light_custom;
       break;
     }
-    case BunkerSystemStatusMsg: {
-      // std::cout << "system status feedback received" << std::endl;
-      const SystemStatusMessage &msg = status_msg.body.system_status_msg;
-      state.control_mode = msg.data.status.control_mode;
-      state.base_state = msg.data.status.base_state;
-      state.battery_voltage =
-          (static_cast<uint16_t>(msg.data.status.battery_voltage.low_byte) |
-           static_cast<uint16_t>(msg.data.status.battery_voltage.high_byte)
-               << 8) /
+    case AgxMsgActuatorHSState: {
+      // std::cout << "actuator hs feedback received" << std::endl;
+      const ActuatorHSStateMessage &msg = status_msg.body.actuator_hs_state_msg;
+      state.actuator_states[msg.motor_id].motor_current =
+          (static_cast<uint16_t>(msg.data.state.current.low_byte) |
+           static_cast<uint16_t>(msg.data.state.current.high_byte) << 8) /
           10.0;
-      state.fault_code =
-          (static_cast<uint16_t>(msg.data.status.fault_code.low_byte) |
-           static_cast<uint16_t>(msg.data.status.fault_code.high_byte) << 8);
+      state.actuator_states[msg.motor_id].motor_rpm = static_cast<int16_t>(
+          static_cast<uint16_t>(msg.data.state.rpm.low_byte) |
+          static_cast<uint16_t>(msg.data.state.rpm.high_byte) << 8);
+      state.actuator_states[msg.motor_id].motor_pulses = static_cast<int32_t>(
+          static_cast<uint32_t>(msg.data.state.pulse_count.lsb) |
+          static_cast<uint32_t>(msg.data.state.pulse_count.low_byte) << 8 |
+          static_cast<uint32_t>(msg.data.state.pulse_count.high_byte) << 16 |
+          static_cast<uint32_t>(msg.data.state.pulse_count.msb) << 24);
       break;
     }
-    case BunkerMotorDriverStatusMsg: {
-      // std::cout << "motor 1 driver feedback received" << std::endl;
-      const MotorDriverStatusMessage &msg =
-          status_msg.body.motor_driver_status_msg;
-      for (int i = 0; i < BunkerState::motor_num; ++i) {
-        state.motor_states[status_msg.body.motor_driver_status_msg.motor_id]
-            .current =
-            (static_cast<uint16_t>(msg.data.status.current.low_byte) |
-             static_cast<uint16_t>(msg.data.status.current.high_byte) << 8) /
+    case AgxMsgActuatorLSState: {
+      // std::cout << "actuator ls feedback received" << std::endl;
+      const ActuatorLSStateMessage &msg = status_msg.body.actuator_ls_state_msg;
+      for (int i = 0; i < 2; ++i) {
+        state.actuator_states[msg.motor_id].driver_voltage =
+            (static_cast<uint16_t>(msg.data.state.driver_voltage.low_byte) |
+             static_cast<uint16_t>(msg.data.state.driver_voltage.high_byte)
+                 << 8) /
             10.0;
-        state.motor_states[status_msg.body.motor_driver_status_msg.motor_id]
-            .rpm = static_cast<int16_t>(
-            static_cast<uint16_t>(msg.data.status.rpm.low_byte) |
-            static_cast<uint16_t>(msg.data.status.rpm.high_byte) << 8);
-        state.motor_states[status_msg.body.motor_driver_status_msg.motor_id]
-            .temperature = msg.data.status.temperature;
+        state.actuator_states[msg.motor_id]
+            .driver_temperature = static_cast<int16_t>(
+            static_cast<uint16_t>(msg.data.state.driver_temperature.low_byte) |
+            static_cast<uint16_t>(msg.data.state.driver_temperature.high_byte)
+                << 8);
+        state.actuator_states[msg.motor_id].motor_temperature =
+            msg.data.state.motor_temperature;
+        state.actuator_states[msg.motor_id].driver_state =
+            msg.data.state.driver_state;
       }
       break;
     }
+    case AgxMsgOdometry: {
+      // std::cout << "Odometer msg feedback received" << std::endl;
+      const OdometryMessage &msg = status_msg.body.odometry_msg;
+      state.right_odometry = static_cast<int32_t>(
+          (static_cast<uint32_t>(msg.state.right_wheel.lsb)) |
+          (static_cast<uint32_t>(msg.state.right_wheel.low_byte) << 8) |
+          (static_cast<uint32_t>(msg.state.right_wheel.high_byte) << 16) |
+          (static_cast<uint32_t>(msg.state.right_wheel.msb) << 24));
+      state.left_odometry = static_cast<int32_t>(
+          (static_cast<uint32_t>(msg.state.left_wheel.lsb)) |
+          (static_cast<uint32_t>(msg.state.left_wheel.low_byte) << 8) |
+          (static_cast<uint32_t>(msg.state.left_wheel.high_byte) << 16) |
+          (static_cast<uint32_t>(msg.state.left_wheel.msb) << 24));
+      break;    // EA
+    }
+    
+    case AgxMsgRcState: {
+    // std::cout << "RC msg feedback received" << std::endl;  
+    const RcStateMessage &msg = status_msg.body.rc_state_msg;
+    state.rc_state.sws = msg.state.sws;    
+    state.rc_state.var_a = msg.state.var_a;    
+    state.rc_state.right_stick_left_right = msg.state.right_stick_left_right;   
+    state.rc_state.right_stick_up_down = msg.state.right_stick_up_down;         
+    state.rc_state.left_stick_left_right = msg.state.left_stick_left_right;     
+    state.rc_state.left_stick_up_down = msg.state.left_stick_up_down;           
+    }    // EA
   }
 }
 }  // namespace westonrobot
