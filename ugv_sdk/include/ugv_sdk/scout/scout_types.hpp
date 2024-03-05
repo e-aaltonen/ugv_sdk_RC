@@ -6,6 +6,11 @@
  *
  * Copyright (c) 2019 Ruixiang Du (rdu)
  */
+ 
+ /* Modifications by E. Aaltonen 2024
+ * for publishing RC status messages
+ * changes indicated: // EA
+ */
 
 #ifndef SCOUT_STATE_HPP
 #define SCOUT_STATE_HPP
@@ -33,6 +38,11 @@ struct ScoutState {
     uint8_t custom_value = 0;
   };
 
+  struct RCState {
+    uint8_t sws = 0;
+    int8_t var_a = 0;
+  };    // EA
+  
   // base state
   uint8_t base_state = 0;
   uint8_t control_mode = 0;
@@ -51,6 +61,9 @@ struct ScoutState {
   // motion state
   double linear_velocity = 0;
   double angular_velocity = 0;
+  
+  // RC state    // EA
+  RCState rc_state;
 };
 
 struct ScoutMotionCmd {

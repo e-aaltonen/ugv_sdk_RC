@@ -46,7 +46,7 @@ struct BunkerState {
   struct RCState {
     uint8_t sws = 0;
     int8_t var_a = 0;
-  };    //.
+  };    // EA
 
   // base state
   uint8_t base_state = 0;

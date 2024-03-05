@@ -1,3 +1,8 @@
+/* Modifications by E. Aaltonen 2024
+ * for publishing RC status messages
+ * changes indicated: // EA
+ */
+ 
 #include "ugv_sdk/scout/scout_base.hpp"
 
 #include <string>
@@ -298,6 +303,17 @@ void ScoutBase::UpdateScoutState(const ScoutMessage &status_msg,
       }
       break;
     }
+    
+    case AgxMsgRcState: {
+    // std::cout << "RC msg feedback received" << std::endl;  
+    const RcStateMessage &msg = status_msg.body.rc_state_msg;
+    state.rc_state.sws = msg.state.sws;    
+    state.rc_state.var_a = msg.state.var_a;    
+    state.rc_state.right_stick_left_right = msg.state.right_stick_left_right;   
+    state.rc_state.right_stick_up_down = msg.state.right_stick_up_down;         
+    state.rc_state.left_stick_left_right = msg.state.left_stick_left_right;     
+    state.rc_state.left_stick_up_down = msg.state.left_stick_up_down;           
+    }    // EA
   }
 }
 }  // namespace westonrobot
